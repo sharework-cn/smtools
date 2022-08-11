@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
-	"flag"
+
 	"fmt"
 	"io"
 	stdlog "log"
@@ -12,22 +12,24 @@ import (
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/text/transform"
-
 	"github.com/dimchansky/utfbom"
 	"github.com/mitchellh/go-homedir"
+	flag "github.com/spf13/pflag"
 	"github.com/tjfoc/gmsm/sm4"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/html/charset"
+	"golang.org/x/text/transform"
 )
 
 const (
-	tag        string = "smtools encrypted"
-	bufferSize int    = 4096
-	envKey     string = "SM4_KEY"
-	folderKey  string = "secrets"
-	fileKey    string = "sm4key"
+	tag               string = "smtools encrypted"
+	bufferSize        int    = 4096
+	envKey            string = "SM4_KEY"
+	configPath        string = "/conf"
+	securedConfigPath string = "/secrets"
+	folderKey         string = "secrets"
+	fileKey           string = "sm4key"
 )
 
 var (
@@ -47,11 +49,10 @@ func main() {
 	)
 
 	// cli arguments processing
-	flag.StringVar(&key, "key", "", `The SM4 Key for encrypt/decrypt, if omitted, 
-get it from SM4_KEY or ~/secrets/sm4key`)
-	flag.BoolVar(&decrypt, "decrypt", false, "Decrypt the data rather than encrypt it")
+	flag.StringVarP(&key, "key", "k", "", `Key used for SM4 algorithm`)
+	flag.BoolVarP(&decrypt, "decrypt", "d", false, "Decrypt the data rather than encrypt it")
 	flag.BoolVar(&stdin, "stdin", false, "Read data from stdin")
-	flag.StringVar(&output, "output", "", "Output file name, default to stdout")
+	flag.StringVarP(&output, "output", "o", "", "Output file name, default to stdout")
 	flag.StringVar(&tag, "tag", "", "A leading tag inserted into the encrypted file")
 	flag.StringVar(&logLevel, "log-level", "info", "Log level(fatal/error/warn/info/debug)")
 	flag.Usage = func() {
@@ -62,6 +63,22 @@ Options`)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	projectPath, _ := os.Getwd()
+	fmt.Fprint(os.Stdout, projectPath)
+	var cp string
+	var scp string
+	if !filepath.IsAbs(configPath) {
+		cp = filepath.Join(projectPath, configPath)
+	} else {
+		cp = configPath
+	}
+	if !filepath.IsAbs(securedConfigPath) {
+		scp = filepath.Join(projectPath, securedConfigPath)
+	} else {
+		scp = securedConfigPath
+	}
+	fmt.Fprintf(os.Stdout, "config path is %s, %s", cp, scp)
 
 	// create log
 	l, err := createLogger(logLevel)
