@@ -14,7 +14,9 @@ import (
 
 	"github.com/dimchansky/utfbom"
 	"github.com/mitchellh/go-homedir"
+	swcmfs "github.com/sharework-cn/go/common/fs"
 	flag "github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"github.com/tjfoc/gmsm/sm4"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -25,47 +27,64 @@ import (
 const (
 	tag               string = "smtools encrypted"
 	bufferSize        int    = 4096
+	envPrefix         string = "smt"
+	configName        string = "smtools"
 	envKey            string = "SM4_KEY"
-	configPath        string = "/conf"
-	securedConfigPath string = "/secrets"
+	configPath        string = "/etc/smtools/conf"
+	securedConfigPath string = "/etc/smtools/secrets"
 	folderKey         string = "secrets"
 	fileKey           string = "sm4key"
 )
 
 var (
 	log zap.SugaredLogger
+	opt swcmfs.Tour
 )
 
 func main() {
 
-	var (
+	type cli struct {
 		decrypt  bool   // flag - decrypt
-		key      string // flag - key
+		Key      string // flag - key
 		logLevel string // flag - log-level
 		output   string // flag - output
 		stdin    bool   // flag - stdin
 		tag      string // flag - tag
-		fname    string // argument 1 - input file name
+	}
+	var (
+		fname string // argument 1 - input file name
 	)
 
-	// cli arguments processing
-	flag.StringVarP(&key, "key", "k", "", `Key used for SM4 algorithm`)
-	flag.BoolVarP(&decrypt, "decrypt", "d", false, "Decrypt the data rather than encrypt it")
-	flag.BoolVar(&stdin, "stdin", false, "Read data from stdin")
-	flag.StringVarP(&output, "output", "o", "", "Output file name, default to stdout")
-	flag.StringVar(&tag, "tag", "", "A leading tag inserted into the encrypted file")
-	flag.StringVar(&logLevel, "log-level", "info", "Log level(fatal/error/warn/info/debug)")
+	// setup flags
+	flag.StringP("key", "k", "", `Key used for SM4 algorithm`)
+	flag.BoolP("decrypt", "d", false, "Decrypt the data rather than encrypt it")
+	flag.Bool("stdin", false, "Read data from stdin")
+	flag.StringP("output", "o", "", "Output file name, default to stdout")
+	flag.String("tag", "", "A leading tag inserted into the encrypted file")
+	flag.String("log-level", "info", "Log level(fatal/error/warn/info/debug)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Command line tool for SM4 encryption/decryption
 Usage: smtools [options...] <file>
 Options`)
 		fmt.Fprint(os.Stderr, "\n")
 		flag.PrintDefaults()
+		fmt.Fprint(os.Stderr, "Options can be also configured from environment variables "+
+			"and configuration files, please refer to https://github.com/sharework-cn/smtools")
 	}
+	flag.ErrHelp = errors.New("")
 	flag.Parse()
+	viper.BindPFlags(flag.CommandLine)
 
+	// setup environment variables
+	// The prefix of environment variables for this app is `SMT_`
+	viper.SetEnvPrefix(envPrefix)
+	viper.AutomaticEnv()
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+
+	// setup configuration files
+	// NOTICE : for windows, `/topdir` is treated as a non-abs directory, so
+	// the configuration files are located in `<project dir>\topdir`
 	projectPath, _ := os.Getwd()
-	fmt.Fprint(os.Stdout, projectPath)
 	var cp string
 	var scp string
 	if !filepath.IsAbs(configPath) {
@@ -78,7 +97,20 @@ Options`)
 	} else {
 		scp = securedConfigPath
 	}
-	fmt.Fprintf(os.Stdout, "config path is %s, %s", cp, scp)
+	viper.SetConfigName(configName) // name of config file (without extension)
+	viper.AddConfigPath(cp)         // add config path for normal items
+	viper.AddConfigPath(scp)        // add config path for secured items
+	viper.AddConfigPath(".")        // optionally look for config in the working directory
+	err := viper.ReadInConfig()     // Find and read the config file
+	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			// configuration files exist and error happened
+			stdlog.Fatalf("Error reading configuration files!\n%s", err)
+			return
+		}
+	}
+
+	logLevel := viper.GetString("log-level")
 
 	// create log
 	l, err := createLogger(logLevel)

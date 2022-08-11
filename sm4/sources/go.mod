@@ -1,4 +1,4 @@
-module sharework-cn/utils/smtools
+module sharework-cn/smtools
 
 go 1.18
 

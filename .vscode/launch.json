@@ -10,7 +10,7 @@
             "request": "launch",
             "mode": "auto",
             "program": "${fileDirname}",
-//            "env": {"SM4_KEY": "1234567890abcdef"}
+            "env": {"SMT_LOG_LEVEL": "debug"}
         }
     ]
 }
