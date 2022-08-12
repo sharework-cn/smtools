@@ -105,7 +105,7 @@ Options`)
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			// configuration files exist and error happened
-			stdlog.Fatalf("Error reading configuration files!\n%s", err)
+			stdlog.Fatalf("Error reading configuration files!\n%+v\n", err)
 			return
 		}
 	}
@@ -115,7 +115,7 @@ Options`)
 	// create log
 	l, err := createLogger(logLevel)
 	if err != nil {
-		stdlog.Fatalf("Failed to create logger! \n%s", err)
+		stdlog.Fatalf("Failed to create logger! \n%+v\n", err)
 		return
 	}
 	log := l
@@ -134,7 +134,7 @@ Options`)
 		kf := filepath.Join(h, folderKey, fileKey)
 		_, err = os.Stat(kf)
 		if err != nil {
-			log.Fatalf("Key is not specified!\n%s",
+			log.Fatalf("Key is not specified!\n%+v\n",
 				err)
 			return
 		}
@@ -183,11 +183,11 @@ Options`)
 		// pipe line
 		fi, err := os.Stdin.Stat()
 		if err != nil {
-			log.Fatalf("Failed to get state of stdin!\n%s", err)
+			log.Fatalf("Failed to get state of stdin!\n%+v\n", err)
 			return
 		}
 		if (fi.Mode() & os.ModeNamedPipe) != os.ModeNamedPipe {
-			log.Fatalf("There's no input from named pipe!\n%s", err)
+			log.Fatalf("There's no input from named pipe!\n%+v\n", err)
 			return
 		}
 		r = bufio.NewReaderSize(os.Stdin, bufferSize)
@@ -226,11 +226,11 @@ Options`)
 		// pipe line
 		fi, err := os.Stdin.Stat()
 		if err != nil {
-			log.Errorf("Failed to get state of stdin!\n%s", err)
+			log.Errorf("Failed to get state of stdin!\n%+v\n", err)
 			return
 		}
 		if (fi.Mode() & os.ModeNamedPipe) != os.ModeNamedPipe {
-			log.Errorf("There's no input from named pipe!\n%s", err)
+			log.Errorf("There's no input from named pipe!\n%+v\n", err)
 			return
 		}
 		r = bufio.NewReaderSize(os.Stdin, bufferSize)
@@ -290,7 +290,7 @@ Options`)
 	sm4.SetIV(iv)                             //设置SM4算法实现的IV值,不设置则使用默认值
 	ecbMsg, err := sm4.Sm4Ecb(hk, data, true) //sm4Ecb模式pksc7填充加密
 	if err != nil {
-		log.Errorf("sm4 enc error:%s", err)
+		log.Errorf("sm4 enc error:\n%+v\n", err)
 		return
 	}
 	log.Debugf("ecbMsg = %x\n", ecbMsg)
