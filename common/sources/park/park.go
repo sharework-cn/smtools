@@ -1,6 +1,7 @@
 package park
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -28,6 +29,8 @@ const (
 // The workload can be consumed by the worker
 type Tour[T comparable] interface {
 	GetTicket() T
+	AddError(error)
+	HasError() bool
 }
 
 type Context[T comparable] struct {
@@ -73,7 +76,7 @@ func Finished() int {
 }
 
 func (t *Park[T]) Finished() int {
-	return int(t.finished)
+	return int(atomic.LoadInt32(&(t.finished)))
 }
 
 func GetStatus() Status {
@@ -134,7 +137,7 @@ func Start(data chan *Tour[string]) error {
 }
 
 func (t *Park[T]) Start(data chan *Tour[T]) error {
-	for i := 0; i < t.options.concurrency; i ++{
+	for i := 0; i < t.options.concurrency; i++ {
 		t.newChannel(i, data)
 	}
 	time.Sleep(3 * time.Second)
@@ -142,50 +145,56 @@ func (t *Park[T]) Start(data chan *Tour[T]) error {
 }
 
 type uow[T comparable] struct {
-	queue  chan *Tour[T]
-	quit   chan *Tour[T]
-	result chan *Tour[T]
+	queue chan *Tour[T]
+	quit  chan *Tour[T]
 }
 
 func (p *Park[T]) start(id int, f func(*Context[T], *Tour[T]) error,
 	next chan<- *Tour[T]) *uow[T] {
 	queue := make(chan *Tour[T], 10)
 	quit := make(chan *Tour[T])
-	result := make(chan *Tour[T])
+
+	l := len(*p.options.channelFuncs) - 1
 
 	go func() {
 		for {
 			select {
-			case v := <-quit:
-				result <- v
+			case <-quit:
 				return
 			case v := <-queue:
-				err := f(&Context[T]{
-					channelId: id,
-					options:   p.options,
-				}, v)
-				if err != nil {
-					// todo : when error occurs
-				} else {
-					if next != nil {
-						next <- v
+				if !(*v).HasError() {
+					err := f(&Context[T]{
+						channelId: id,
+						options:   p.options,
+					}, v)
+					if err != nil {
+						(*v).AddError(err)
 					}
+				}
+				if id >= l {
+					atomic.AddInt32(&(p.finished), 1)
+					for _, listener := range *p.options.listeners {
+						listener(v, p.Finished(), p.total)
+					}
+				}
+				if next != nil {
+					next <- v
 				}
 			}
 		}
 	}()
-	return &uow[T]{queue: queue, quit: quit, result: result}
+	return &uow[T]{queue: queue, quit: quit}
 }
 
 func (p *Park[T]) newChannel(id int, queue <-chan *Tour[T]) {
 	go func(id int) {
-		l := len(*p.options.channelTemplate)
+		l := len(*p.options.channelFuncs)
 		uows := make([]*uow[T], l)
 		for i := l - 1; i >= 0; i-- {
 			if i == l-1 {
-				uows[i] = p.start(id, (*p.options.channelTemplate)[i], nil)
+				uows[i] = p.start(id, (*p.options.channelFuncs)[i], nil)
 			} else {
-				uows[i] = p.start(id, (*p.options.channelTemplate)[i], (*uows[i+1]).queue)
+				uows[i] = p.start(id, (*p.options.channelFuncs)[i], (*uows[i+1]).queue)
 			}
 		}
 
@@ -193,8 +202,8 @@ func (p *Park[T]) newChannel(id int, queue <-chan *Tour[T]) {
 			select {
 			case v, ok := <-queue:
 				if !ok {
-					for _, q := range uows {
-						close(q.quit)
+					for _, u := range uows {
+						close(u.quit)
 					}
 					return
 				}
