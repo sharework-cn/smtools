@@ -1,71 +1,156 @@
 package park
 
 import (
+	stderrors "errors"
 	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
 )
 
-// T any - the ticket identifier
-type Park[T comparable] struct {
-	options  *ParkOptions[T]
-	status   Status
-	total    int
-	finished int32
+const (
+	MaxChannels  = 256
+	MaxFunctions = 64
+	MaxListeners = 256
+)
+
+var (
+	ErrLimited error = stderrors.New("Exceeds limit!")
+	ErrState   error = stderrors.New("Invalid state!")
+)
+
+// Event passes to the listeners on the status change of Tours
+type Event[T any] struct{}
+
+// Park Configurations
+type ParkConf[T any] struct {
+	channels  int                // specify the number of channels
+	funcs     *[]func(T) error   // functions to be called in each channel
+	listeners *[]func(*Event[T]) // listeners who concerns with tour status change
 }
 
-// Status of workload
+// A function to set a single configuration item
+type Optf[T any] func(*ParkConf[T]) error
+
+// Create a new `ParkConf`
+func NewParkConf[T any](optfs ...Optf[T]) (*ParkConf[T], error) {
+	// build a default options
+	conf := &ParkConf[T]{
+		channels:  1,
+		funcs:     nil,
+		listeners: nil,
+	}
+	// accept custom options
+	for _, optf := range optfs {
+		err := optf(conf)
+		if err != nil {
+			return nil, errors.Wrap(err, "validate")
+		}
+	}
+	return conf, nil
+}
+
+// Return a function to set channels
+func WithChannels[T any](v int) Optf[T] {
+	return func(conf *ParkConf[T]) error {
+		if v > MaxChannels || v < 0 {
+			return ErrLimited
+		}
+		conf.channels = v
+		return nil
+	}
+}
+
+// return a function to set functions
+func WithFuncs[T any](t *[]func(T) (err error)) Optf[T] {
+	return func(conf *ParkConf[T]) error {
+		if len(*t) > MaxFunctions {
+			return ErrLimited
+		}
+		conf.funcs = t
+		return nil
+	}
+}
+
+// return a function to set listeners
+func WithListeners[T any](ls *[]func(*Event[T])) Optf[T] {
+	return func(conf *ParkConf[T]) error {
+		if len(*ls) > MaxListeners {
+			return ErrLimited
+		}
+		conf.listeners = ls
+		return nil
+	}
+}
+
+// get the number of channels
+func (opts *ParkConf[T]) Channels() int {
+	return opts.channels
+}
+
+/*
+The park!
+*/
+type Park[T any] struct {
+	conf     *ParkConf[T]       // configurations
+	status   Status             // status
+	total    int                // total tourists to be served, -1 means unpredicatable
+	finished int32              // number of tourists had been served
+	luid     int32              // last uid
+	ongoing  map[int32]*Tour[T] // the tours of ongoing tourists
+}
+
+// Status of park
 type Status int
 
 const (
-	ParkInitial Status = iota + 1
-	ParkOpen
-	ParkPaused
-	ParkClosed
-	ParkAborted
+	ParkInitial Status = iota + 1 // newly created
+	ParkOpen                      // it's open, the configuration can not be modified
+	ParkPaused                    // paused, no new tourist allowed, can be resumed
+	ParkClosed                    // closed, can not be resumed
+	ParkAborted                   // canceled
 )
 
 // The workload can be consumed by the worker
-type Tour[T comparable] interface {
-	GetTicket() T
-	AddError(error)
-	HasError() bool
+type Tour[T any] struct {
+	uid int32
+	err *error
+	t   *T
 }
 
-type Context[T comparable] struct {
-	channelId int
-	options   *ParkOptions[T]
-}
-
-var t *Park[string]
+// a singleton instance of park, the generic type is any
+var t *Park[any]
 
 func init() {
-	t = New[string]()
+	t = New[any]()
 }
 
-func New[T comparable]() *Park[T] {
-	tourist := new(Park[T])
-	tourist.options = NewTouristOptions[T]()
-	tourist.Reset()
-	return tourist
+// multi instance mode
+func New[T any]() *Park[T] {
+	park := new(Park[T])
+	park.conf, _ = NewParkConf[T]()
+	park.Reset()
+	return park
 }
 
+// get the total tourists to be served, -1 means unpredicatable
 func Total() int {
 	return t.Total()
 }
 
+// get the total tourists to be served, -1 means unpredicatable
 func (t *Park[T]) Total() int {
 	return t.total
 }
 
+// set the total tourists to be served, -1 means unpredicatable
 func SetTotal(total int) error {
 	return t.SetTotal(total)
 }
 
 func (t *Park[T]) SetTotal(total int) error {
 	if t.status != ParkInitial {
-		return errors.New("Invalid State!")
+		return ErrState
 	}
 	t.total = total
 	return nil
@@ -87,23 +172,23 @@ func (t *Park[T]) Status() Status {
 	return t.status
 }
 
-func Options() *ParkOptions[string] {
-	return t.Options()
+func Conf() *ParkConf[any] {
+	return t.Conf()
 }
 
-func (t *Park[T]) Options() *ParkOptions[T] {
-	return t.options
+func (t *Park[T]) Conf() *ParkConf[T] {
+	return t.conf
 }
 
-func SetOptions(options *ParkOptions[string]) error {
-	return t.SetOptions(options)
+func SetConf(options *ParkConf[any]) error {
+	return t.SetConf(options)
 }
 
-func (t *Park[T]) SetOptions(options *ParkOptions[T]) error {
+func (t *Park[T]) SetConf(options *ParkConf[T]) error {
 	if t.status != ParkInitial {
 		return errors.New("Invalid State!")
 	}
-	t.options = options
+	t.conf = options
 	return nil
 }
 
@@ -129,14 +214,16 @@ func (t *Park[T]) Reset() error {
 	t.status = ParkInitial
 	t.total = -1
 	t.finished = 0
+	t.luid = 0
+	t.ongoing = make(map[int32]*Tour[T], 16)
 	return nil
 }
 
-func Start(data chan *Tour[string]) error {
+func Start(data <-chan any) error {
 	return t.Start(data)
 }
 
-func (t *Park[T]) Start(data chan *Tour[T]) error {
+func (t *Park[T]) Start(data <-chan T) error {
 	for i := 0; i < t.options.concurrency; i++ {
 		t.newChannel(i, data)
 	}
