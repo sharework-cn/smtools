@@ -267,26 +267,32 @@ func (t *Park[T]) Reset() error {
 }
 
 // start running
-func Start(dataq <-chan any) (successq <-chan any, errorq <-chan any, err error) {
+func Start(data <-chan any) (err error) {
 	return t.Start()
 }
 
 // start running
-func (t *Park[T]) Start(dataq <-chan T) (successq <-chan T, errorq <-chan T, err error) {
-	t.conf.dc = dataq
-	t.conf.sc = make(chan Tour[T], 8)
-	t.conf.fc = make(chan Tour[T], 8)
-	eventq := make(chan RoutineEvent, 8)
+func (t *Park[T]) Start(data <-chan any) (err error) {
+	t.dc = data
+	t.sc = make(chan Tour[T], 8)
+	t.fc = make(chan Tour[T], 8)
+	t.rec = make(chan RoutineEvent, 8)
+	t.tec = make(chan TourEvent, 8)
 	chls := t.conf.numChans	
 	for i := 0; i < chls; i++ {
-		t.newChannel(i)
+		t.newChannel(i, data)
 	}
+	return waitForChannelsReady()
+}
+
+
+func (t *Park[T]) waitForChannelsReady() (err error) {
 	cnt := 0
 	stopLooping := false 
-
+	chls := t.conf.numChans
 	for {
 		select {
-		case e, ok := <-eventq:
+		case e, ok := <-t.rec:
 			if ok {
 				if e.typ == ReChannel && e.status == RsReady {
 					cnt++
@@ -303,9 +309,9 @@ func (t *Park[T]) Start(dataq <-chan T) (successq <-chan T, errorq <-chan T, err
 		}
 	}
 	if cnt < chls {
-		return nil, nil, errors.WithMessagef(ErrNotReady, "Ready channels %d, desired %d", cnt, chls)
+		return errors.WithMessagef(ErrNotReady, "Ready channels %d, desired %d", cnt, chls)
 	}
-	return t.conf.sc, t.conf.fc, nil
+	return nil
 }
 
 type uow[T any] struct {
