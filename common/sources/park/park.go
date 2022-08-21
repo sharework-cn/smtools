@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"google.golang.org/genproto/googleapis/cloud/dataproc/v1"
 )
 
 const (
@@ -17,16 +18,42 @@ const (
 var (
 	ErrLimited error = stderrors.New("Exceeds limit!")
 	ErrState   error = stderrors.New("Invalid state!")
+	ErrNotReady error = stderrors.New("Not ready!")
 )
 
-// Event passes to the listeners on the status change of Tours
-type Event[T any] struct{}
+// TourEvent passes to the listeners on the status change of Tours
+type TourEvent[T any] struct{}
+
+// RoutineStatus indicates the status of a go routine
+type RoutineStatus int
+
+const (
+	RsInit RoutineStatus = iota + 1	// Go routine created
+	RsReady	// Routine is ready for work
+	RsClosing	// Routine is about to close, it's read only
+	RsClosed	// Routine is closed
+)
+
+type ReType int
+
+const (
+	ReChannel ReType = iota + 1
+	ReFunc
+)
+
+// RoutineEvent notifies the status of channel and their functions
+type RoutineEvent struct{
+	typ 	ReType
+	cid int
+	fid int
+	status RoutineStatus
+}
 
 // Park Configurations
 type ParkConf[T any] struct {
-	channels  int                // specify the number of channels
-	funcs     *[]func(T) error   // functions to be called in each channel
-	listeners *[]func(*Event[T]) // listeners who concerns with tour status change
+	numChans  int                // specify the number of channels
+	funcs     []func(T) error   // functions to be called in each channel
+	listeners []func(*TourEvent[T]) // listeners who concerns with tour status change
 }
 
 // A function to set a single configuration item
@@ -36,9 +63,9 @@ type Optf[T any] func(*ParkConf[T]) error
 func NewParkConf[T any](optfs ...Optf[T]) (*ParkConf[T], error) {
 	// build a default options
 	conf := &ParkConf[T]{
-		channels:  1,
-		funcs:     nil,
-		listeners: nil,
+		numChans:  1,
+		funcs:     make([]func(T) error, 4),
+		listeners: make([]func(*TourEvent[T]), 2),
 	}
 	// accept custom options
 	for _, optf := range optfs {
@@ -51,12 +78,12 @@ func NewParkConf[T any](optfs ...Optf[T]) (*ParkConf[T], error) {
 }
 
 // Return a function to set channels
-func WithChannels[T any](v int) Optf[T] {
+func WithNumChannels[T any](v int) Optf[T] {
 	return func(conf *ParkConf[T]) error {
 		if v > MaxChannels || v < 0 {
 			return ErrLimited
 		}
-		conf.channels = v
+		conf.numChans = v
 		return nil
 	}
 }
@@ -73,7 +100,7 @@ func WithFuncs[T any](t *[]func(T) (err error)) Optf[T] {
 }
 
 // return a function to set listeners
-func WithListeners[T any](ls *[]func(*Event[T])) Optf[T] {
+func WithListeners[T any](ls *[]func(*TourEvent[T])) Optf[T] {
 	return func(conf *ParkConf[T]) error {
 		if len(*ls) > MaxListeners {
 			return ErrLimited
@@ -84,8 +111,8 @@ func WithListeners[T any](ls *[]func(*Event[T])) Optf[T] {
 }
 
 // get the number of channels
-func (opts *ParkConf[T]) Channels() int {
-	return opts.channels
+func (opts ParkConf[T]) NumChannels() int {
+	return opts.numChans
 }
 
 /*
@@ -93,11 +120,15 @@ The park!
 */
 type Park[T any] struct {
 	conf     *ParkConf[T]       // configurations
+	dc 	chan T	// data channel
+	sc 	chan Tour[T]	// successful channel
+	fc 	chan Tour[T]	// failure channel
+	rec 	chan RoutineEvent 
+	tec	chan TourEvent	//
 	status   Status             // status
-	total    int                // total tourists to be served, -1 means unpredicatable
-	finished int32              // number of tourists had been served
-	luid     int32              // last uid
-	ongoing  map[int32]*Tour[T] // the tours of ongoing tourists
+	total    int                // total tourists, -1 means unpredicatable
+	succeeds int32              // number of tourists who complete all of their tours successfully
+	failures int32              // number of tourists who encount failure
 }
 
 // Status of park
@@ -111,9 +142,8 @@ const (
 	ParkAborted                   // canceled
 )
 
-// The workload can be consumed by the worker
+// The Tour hold the infomation about the tourist
 type Tour[T any] struct {
-	uid int32
 	err *error
 	t   *T
 }
@@ -125,7 +155,7 @@ func init() {
 	t = New[any]()
 }
 
-// multi instance mode
+// park creation method for multi instance mode
 func New[T any]() *Park[T] {
 	park := new(Park[T])
 	park.conf, _ = NewParkConf[T]()
@@ -148,6 +178,7 @@ func SetTotal(total int) error {
 	return t.SetTotal(total)
 }
 
+// set the total tourists to be served, -1 means unpredicatable
 func (t *Park[T]) SetTotal(total int) error {
 	if t.status != ParkInitial {
 		return ErrState
@@ -156,92 +187,137 @@ func (t *Park[T]) SetTotal(total int) error {
 	return nil
 }
 
+// get the number of finished tourists
 func Finished() int {
 	return t.Finished()
 }
 
+// get the number of finished tourists
 func (t *Park[T]) Finished() int {
-	return int(atomic.LoadInt32(&(t.finished)))
+	return int(atomic.LoadInt32(&(t.succeeds)))
 }
 
+// get the status of park
 func GetStatus() Status {
 	return t.Status()
 }
 
+// get the status of park
 func (t *Park[T]) Status() Status {
 	return t.status
 }
 
+// get the configuration of park
 func Conf() *ParkConf[any] {
 	return t.Conf()
 }
 
+// get the configuration of park
 func (t *Park[T]) Conf() *ParkConf[T] {
 	return t.conf
 }
 
+// set the configuration of park
 func SetConf(options *ParkConf[any]) error {
 	return t.SetConf(options)
 }
 
+// set the configuration of park
 func (t *Park[T]) SetConf(options *ParkConf[T]) error {
 	if t.status != ParkInitial {
-		return errors.New("Invalid State!")
+		return errors.WithMessagef(ErrState, 
+			"desired is Initial, actual : %d", t.status)
 	}
 	t.conf = options
 	return nil
 }
 
+// cancel all ongoing tour
 func Cancel() error {
 	return t.Cancel()
 }
 
+// cancel all ongoing tour
 func (t *Park[T]) Cancel() error {
+	t.status = ParkAborted
 	return nil
 }
 
+// reset the runtime information of the park
 func Reset() error {
 	return t.Reset()
 }
 
+// reset the runtime information of the park
 func (t *Park[T]) Reset() error {
 	if t.status == ParkPaused || t.status == ParkOpen {
 		err := t.Cancel()
 		if err != nil {
 			return errors.Wrap(err, "cancel")
 		}
+	} else {
+		if t.status == ParkClosed {
+			return errors.Wrap(ErrState, "can not reset park when it's closed")
+		}
 	}
 	t.status = ParkInitial
 	t.total = -1
-	t.finished = 0
-	t.luid = 0
-	t.ongoing = make(map[int32]*Tour[T], 16)
+	t.succeeds = 0
 	return nil
 }
 
-func Start(data <-chan any) error {
-	return t.Start(data)
+// start running
+func Start(dataq <-chan any) (successq <-chan any, errorq <-chan any, err error) {
+	return t.Start()
 }
 
-func (t *Park[T]) Start(data <-chan T) error {
-	for i := 0; i < t.options.concurrency; i++ {
-		t.newChannel(i, data)
+// start running
+func (t *Park[T]) Start(dataq <-chan T) (successq <-chan T, errorq <-chan T, err error) {
+	t.conf.dc = dataq
+	t.conf.sc = make(chan Tour[T], 8)
+	t.conf.fc = make(chan Tour[T], 8)
+	eventq := make(chan RoutineEvent, 8)
+	chls := t.conf.numChans	
+	for i := 0; i < chls; i++ {
+		t.newChannel(i)
 	}
-	time.Sleep(3 * time.Second)
-	return nil
+	cnt := 0
+	stopLooping := false 
+
+	for {
+		select {
+		case e, ok := <-eventq:
+			if ok {
+				if e.typ == ReChannel && e.status == RsReady {
+					cnt++
+				}
+				if cnt >= chls {
+					stopLooping = true 
+				}
+			} else {
+				stopLooping = true 
+			}
+		}
+		if stopLooping {
+			break
+		}
+	}
+	if cnt < chls {
+		return nil, nil, errors.WithMessagef(ErrNotReady, "Ready channels %d, desired %d", cnt, chls)
+	}
+	return t.conf.sc, t.conf.fc, nil
 }
 
-type uow[T comparable] struct {
+type uow[T any] struct {
 	queue chan *Tour[T]
 	quit  chan *Tour[T]
 }
 
-func (p *Park[T]) start(id int, f func(*Context[T], *Tour[T]) error,
-	next chan<- *Tour[T]) *uow[T] {
+func (p *Park[T]) start(f func( data chan<- T) err error,	next chan<- T, errc ->chan T) *uow[T] {
 	queue := make(chan *Tour[T], 10)
 	quit := make(chan *Tour[T])
 
-	l := len(*p.options.channelFuncs) - 1
+	l := len(*p.conf.funcs) - 1
 
 	go func() {
 		for {
@@ -249,19 +325,16 @@ func (p *Park[T]) start(id int, f func(*Context[T], *Tour[T]) error,
 			case <-quit:
 				return
 			case v := <-queue:
-				if !(*v).HasError() {
-					err := f(&Context[T]{
-						channelId: id,
-						options:   p.options,
-					}, v)
-					if err != nil {
-						(*v).AddError(err)
-					}
+				err := f(v.t)
+				if err != nil {
+					v.err = &err
+					v -> errc
 				}
 				if id >= l {
-					atomic.AddInt32(&(p.finished), 1)
-					for _, listener := range *p.options.listeners {
-						listener(v, p.Finished(), p.total)
+					atomic.AddInt32(&(p.succeeds), 1)
+					for _, listener := range *p.conf.listeners {
+						// TODO : compose the event when tour finished
+						listener(&TourEvent{})
 					}
 				}
 				if next != nil {
@@ -275,7 +348,7 @@ func (p *Park[T]) start(id int, f func(*Context[T], *Tour[T]) error,
 
 func (p *Park[T]) newChannel(id int, queue <-chan *Tour[T]) {
 	go func(id int) {
-		l := len(*p.options.channelFuncs)
+		l := len(p.conf.numChans)
 		uows := make([]*uow[T], l)
 		for i := l - 1; i >= 0; i-- {
 			if i == l-1 {
