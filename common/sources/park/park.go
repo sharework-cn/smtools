@@ -2,9 +2,10 @@ package park
 
 import (
 	stderrors "errors"
+	"runtime"
 	"sync/atomic"
 	"time"
-
+	"log"
 	"github.com/pkg/errors"
 	"google.golang.org/genproto/googleapis/cloud/dataproc/v1"
 )
@@ -13,12 +14,14 @@ const (
 	MaxChannels  = 256
 	MaxFunctions = 64
 	MaxListeners = 256
+	ChannelCache = 8
 )
 
 var (
-	ErrLimited error = stderrors.New("Exceeds limit!")
-	ErrState   error = stderrors.New("Invalid state!")
-	ErrNotReady error = stderrors.New("Not ready!")
+	ErrArg         = stderrors.New("invalid argument")
+	ErrState       = stderrors.New("invalid state")
+//	ErrOp    = stderrors.New("invalid operation")
+	ErrAbort = stderrors.New("abort anyway")
 )
 
 // TourEvent passes to the listeners on the status change of Tours
@@ -49,20 +52,20 @@ type RoutineEvent struct{
 	status RoutineStatus
 }
 
-// Park Configurations
-type ParkConf[T any] struct {
+// GetConf Park Configurations
+type Conf[T any] struct {
 	numChans  int                // specify the number of channels
 	funcs     []func(T) error   // functions to be called in each channel
 	listeners []func(*TourEvent[T]) // listeners who concerns with tour status change
 }
 
-// A function to set a single configuration item
-type Optf[T any] func(*ParkConf[T]) error
+// Optf An option function defines the way to set a configuration option
+type Optf[T any] func(*Conf[T]) error
 
-// Create a new `ParkConf`
-func NewParkConf[T any](optfs ...Optf[T]) (*ParkConf[T], error) {
+// NewParkConf Create a new `GetConf`
+func NewParkConf[T any](optfs ...Optf[T]) (*Conf[T], error) {
 	// build a default options
-	conf := &ParkConf[T]{
+	conf := &Conf[T]{
 		numChans:  1,
 		funcs:     make([]func(T) error, 4),
 		listeners: make([]func(*TourEvent[T]), 2),
@@ -77,72 +80,77 @@ func NewParkConf[T any](optfs ...Optf[T]) (*ParkConf[T], error) {
 	return conf, nil
 }
 
-// Return a function to set channels
+// WithNumChannels Return a function to set channels
 func WithNumChannels[T any](v int) Optf[T] {
-	return func(conf *ParkConf[T]) error {
+	return func(conf *Conf[T]) error {
 		if v > MaxChannels || v < 0 {
-			return ErrLimited
+			return ErrArg
 		}
 		conf.numChans = v
 		return nil
 	}
 }
 
-// return a function to set functions
-func WithFuncs[T any](t *[]func(T) (err error)) Optf[T] {
-	return func(conf *ParkConf[T]) error {
-		if len(*t) > MaxFunctions {
-			return ErrLimited
+// WithFuncs return a function to set functions
+func WithFuncs[T any](t []func(T) error) Optf[T] {
+	return func(conf *Conf[T]) error {
+		if len(t) > MaxFunctions {
+			return ErrArg
 		}
 		conf.funcs = t
 		return nil
 	}
 }
 
-// return a function to set listeners
-func WithListeners[T any](ls *[]func(*TourEvent[T])) Optf[T] {
-	return func(conf *ParkConf[T]) error {
-		if len(*ls) > MaxListeners {
-			return ErrLimited
+// WithListeners return a function to set listeners
+func WithListeners[T any](ls []func(*TourEvent[T])) Optf[T] {
+	return func(conf *Conf[T]) error {
+		if len(ls) > MaxListeners {
+			return ErrArg
 		}
 		conf.listeners = ls
 		return nil
 	}
 }
 
-// get the number of channels
-func (opts ParkConf[T]) NumChannels() int {
+// NumChannels get the number of channels
+func (opts Conf[T]) NumChannels() int {
 	return opts.numChans
 }
 
-/*
-The park!
-*/
+// Park The Park container
 type Park[T any] struct {
-	conf     *ParkConf[T]       // configurations
-	dc 	chan T	// data channel
-	sc 	chan Tour[T]	// successful channel
-	fc 	chan Tour[T]	// failure channel
-	rec 	chan RoutineEvent 
-	tec	chan TourEvent	//
-	status   Status             // status
-	total    int                // total tourists, -1 means unpredicatable
-	succeeds int32              // number of tourists who complete all of their tours successfully
-	failures int32              // number of tourists who encount failure
+	conf     *Conf[T]      // configurations
+	es 		*EventServer[T] // event server
+	dq 	<-chan T            // data queue which provided by client
+	dsq 	chan Tour[T]       // dispatching queue
+	ppq chan Tour[T]          // post processing queue
+	endq chan struct{}        // ending queue
+	status   Status           // status
 }
 
 // Status of park
 type Status int
 
 const (
-	ParkInitial Status = iota + 1 // newly created
-	ParkOpen                      // it's open, the configuration can not be modified
-	ParkPaused                    // paused, no new tourist allowed, can be resumed
-	ParkClosed                    // closed, can not be resumed
-	ParkAborted                   // canceled
+	StateInitial Status = iota + 1 // newly created
+	Open                           // it's open, the configuration can not be modified
+	ParkPaused                     // paused, no new tourist allowed, can be resumed
+	ParkClosed                     // closed, can not be resumed
+	ParkAborted                    // canceled
 )
 
-// The Tour hold the infomation about the tourist
+/*
+Event Server!
+*/
+type EventServer[T any] struct {
+	listeners []func(*TourEvent[T])	// listeners
+	eq chan TourEvent[T] // event queue
+	eqx chan struct{} // exiting queue for the looping on the eq
+	eeq chan struct{}	// ending queue for the eq
+}
+
+// The Tour hold the information about the tourist
 type Tour[T any] struct {
 	err *error
 	t   *T
@@ -163,40 +171,6 @@ func New[T any]() *Park[T] {
 	return park
 }
 
-// get the total tourists to be served, -1 means unpredicatable
-func Total() int {
-	return t.Total()
-}
-
-// get the total tourists to be served, -1 means unpredicatable
-func (t *Park[T]) Total() int {
-	return t.total
-}
-
-// set the total tourists to be served, -1 means unpredicatable
-func SetTotal(total int) error {
-	return t.SetTotal(total)
-}
-
-// set the total tourists to be served, -1 means unpredicatable
-func (t *Park[T]) SetTotal(total int) error {
-	if t.status != ParkInitial {
-		return ErrState
-	}
-	t.total = total
-	return nil
-}
-
-// get the number of finished tourists
-func Finished() int {
-	return t.Finished()
-}
-
-// get the number of finished tourists
-func (t *Park[T]) Finished() int {
-	return int(atomic.LoadInt32(&(t.succeeds)))
-}
-
 // get the status of park
 func GetStatus() Status {
 	return t.Status()
@@ -208,25 +182,25 @@ func (t *Park[T]) Status() Status {
 }
 
 // get the configuration of park
-func Conf() *ParkConf[any] {
-	return t.Conf()
+func GetConf() *Conf[any] {
+	return t.GetConf()
 }
 
 // get the configuration of park
-func (t *Park[T]) Conf() *ParkConf[T] {
+func (t *Park[T]) GetConf() *Conf[T] {
 	return t.conf
 }
 
 // set the configuration of park
-func SetConf(options *ParkConf[any]) error {
+func SetConf(options *GetConf[any]) error {
 	return t.SetConf(options)
 }
 
 // set the configuration of park
-func (t *Park[T]) SetConf(options *ParkConf[T]) error {
-	if t.status != ParkInitial {
+func (t *Park[T]) SetConf(options *GetConf[T]) error {
+	if t.status != StateInitial {
 		return errors.WithMessagef(ErrState, 
-			"desired is Initial, actual : %d", t.status)
+			"Can not configurate in state : %d", t.status)
 	}
 	t.conf = options
 	return nil
@@ -250,21 +224,21 @@ func Reset() error {
 
 // reset the runtime information of the park
 func (t *Park[T]) Reset() error {
-	if t.status == ParkPaused || t.status == ParkOpen {
+	if t.status == ParkPaused || t.status == Open {
 		err := t.Cancel()
 		if err != nil {
 			return errors.Wrap(err, "cancel")
 		}
 	} else {
 		if t.status == ParkClosed {
-			return errors.Wrap(ErrState, "can not reset park when it's closed")
+			return errors.Wrap(ErrState, "Can not reset the park when it's closed")
 		}
 	}
-	t.status = ParkInitial
-	t.total = -1
-	t.succeeds = 0
+	t.status = StateInitial
 	return nil
 }
+
+
 
 // start running
 func Start(data <-chan any) (err error) {
@@ -273,19 +247,36 @@ func Start(data <-chan any) (err error) {
 
 // start running
 func (t *Park[T]) Start(data <-chan any) (err error) {
-	t.dc = data
-	t.sc = make(chan Tour[T], 8)
-	t.fc = make(chan Tour[T], 8)
-	t.rec = make(chan RoutineEvent, 8)
-	t.tec = make(chan TourEvent, 8)
+	t.dq = data
+	t.dsq = make(chan Tour[T], ChannelCache)
+	t.ppq = make(chan Tour[T], ChannelCache)
+	t.eq = make(chan TourEvent, ChannelCache)
+	t.endq = make(chan struct{})
+	t.eeq = make(chan struct{})
+	
 	chls := t.conf.numChans	
 	for i := 0; i < chls; i++ {
 		t.newChannel(i, data)
 	}
-	return waitForChannelsReady()
+	return nil
 }
 
+func (t *Park[T]) startEventListener() {
+	t.dq = data
+	t.dsq = make(chan Tour[T], ChannelCache)
+	t.ppq = make(chan Tour[T], ChannelCache)
+	t.eq = make(chan TourEvent, ChannelCache)
+	t.endq = make(chan struct{})
+	t.eeq = make(chan struct{})
+	
+	chls := t.conf.numChans	
+	for i := 0; i < chls; i++ {
+		t.newChannel(i, data)
+	}
+	return nil
+}
 
+/*
 func (t *Park[T]) waitForChannelsReady() (err error) {
 	cnt := 0
 	stopLooping := false 
@@ -309,10 +300,11 @@ func (t *Park[T]) waitForChannelsReady() (err error) {
 		}
 	}
 	if cnt < chls {
-		return errors.WithMessagef(ErrNotReady, "Ready channels %d, desired %d", cnt, chls)
+		return errors.WithMessagef(ErrOp, "Ready channels %d, desired %d", cnt, chls)
 	}
 	return nil
 }
+*/
 
 type uow[T any] struct {
 	queue chan *Tour[T]
@@ -379,4 +371,51 @@ func (p *Park[T]) newChannel(id int, queue <-chan *Tour[T]) {
 			}
 		}
 	}(id)
+}
+
+
+
+// create a new event server
+func (t *Park[T])newEventServer() {
+	t.es = &EventServer[T]{
+		listeners: t.conf.listeners,
+		eq: make( chan TourEvent[T], ChannelCache),
+		eqx: make( chan struct{}),
+		eeq: make( chan struct{}),
+	}
+}
+
+func (es *EventServer[T])start() {
+	defer func() {
+		if err := recover(); err != nil && err != ErrAbort {
+			
+			const size = 64 << 10
+			buf := make([]byte, size)
+			buf = buf[:runtime.Stack(buf, false)]
+			c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
+		}
+		if inFlightResponse != nil {
+			inFlightResponse.cancelCtx()
+		}
+		if !c.hijacked() {
+			if inFlightResponse != nil {
+				inFlightResponse.conn.r.abortPendingRead()
+				inFlightResponse.reqBody.Close()
+			}
+			c.close()
+			c.setState(c.rwc, StateClosed, runHooks)
+		}
+	}()
+
+	for {
+		select {
+		case <-es.eqx:
+			break
+		case e, ok := <-es.eq:
+			for i, l := range es.listeners {
+				
+				l(*e)
+			}
+		}
+	}
 }
