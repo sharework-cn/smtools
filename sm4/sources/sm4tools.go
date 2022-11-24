@@ -19,17 +19,21 @@ import (
 	"syscall"
 )
 
+type Encryptor interface {
+	Encrypt([]byte) ([]byte, error)
+	Decrypt([]byte) ([]byte, error)
+}
+
 const (
 	tag        string = "sm4 encrypted"
 	bufferSize int    = 4096
 	iv         string = "sharework.cn"
 )
 
-var (
-	log zap.SugaredLogger
-)
-
 func main() {
+
+	// setup handler for SIG_TERM, SIG_KILL, etc.
+	setupCloseHandler()
 
 	// setup flags
 	key := flag.StringP("key", "k", "", `key used for SM4 algorithm`)
@@ -40,10 +44,16 @@ func main() {
 		"test whether the file is valid to encrypt/decrypt")
 	logLevel := flag.String("log-level", "info", "log level(fatal/error/warn/info/debug)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Command line tool for SM4 encryption/decryption
+		_, err := fmt.Fprintf(os.Stderr, `Command line tool for SM4 encryption/decryption
 Usage: smtools [options...] <file>
 Options`)
-		fmt.Fprint(os.Stderr, "\n")
+		if err != nil {
+			return
+		}
+		_, err = fmt.Fprint(os.Stderr, "\n")
+		if err != nil {
+			return
+		}
 		flag.PrintDefaults()
 	}
 	flag.ErrHelp = errors.New("")
@@ -59,7 +69,7 @@ Options`)
 
 	// determine the key
 	if len(*key) != 16 {
-		log.Fatal("key length error!(should be 16)")
+		log.Fatal("key length is invalid, should be 16")
 		return
 	}
 
@@ -68,6 +78,7 @@ Options`)
 	hash.Write([]byte(tag))
 	hash.Write([]byte(*key))
 	pb := []byte(hex.EncodeToString(hash.Sum(nil)))
+	log.Debugf("desired prefix is %x\n", pb)
 
 	r := bufio.NewReaderSize(os.Stdin, bufferSize) // r: reader
 	w := bufio.NewWriter(os.Stdout)                // w: writer
@@ -77,7 +88,7 @@ Options`)
 		b = make([]byte, len(pb), len(pb))
 		rl, err = r.Read(b)
 		if err != nil && err != io.EOF {
-			log.Errorw("failed to read",
+			log.Fatalw("failed to read",
 				"error", err)
 			return
 		}
@@ -85,7 +96,7 @@ Options`)
 		rl = len(pb) // rl is always equal the length of pb in peeking mode
 		b, err = r.Peek(rl)
 		if err != nil && err != bufio.ErrBufferFull {
-			log.Errorw("failed to read",
+			log.Fatalw("failed to read",
 				"error", err)
 			return
 		}
@@ -114,149 +125,40 @@ Options`)
 	}
 
 	b = make([]byte, bufferSize, bufferSize)
-	sm4.SetIV([]byte(iv)) // set the IV value
+	err = sm4.SetIV([]byte(iv)) // set the IV value
+	if err != nil {
+		log.Fatalf("failed to set iv:\n%+v\n", err)
+		return
+	}
+
 	hk := []byte(*key)
-	ecbMsg, err := sm4.Sm4Ecb(hk, data, true) //sm4Ecb模式pksc7填充加密
-	if err != nil {
-		log.Errorf("sm4 enc error:\n%+v\n", err)
-		return
-	}
-	log.Debugf("ecbMsg = %x\n", ecbMsg)
-	ecbDec, err := sm4.Sm4Ecb(hk, ecbMsg, false) //sm4Ecb模式pksc7填充解密
-	if err != nil {
-		log.Errorf("sm4 dec error:%s", err)
-		return
-	}
-	if !*decrypt {
-		w.Write(pb)
-	}
 	for {
 		rl, err = r.Read(b)
 		if err != nil && err != io.EOF {
-			log.Errorw("failed to read",
-				"error", err)
+			log.Fatalf("failed to read:\n%+v\n", err)
 			return
 		}
-		o, err := sm4.Sm4Ecb(hk, b[rl:], true)
-		if err != nil {
-			log.Errorf("sm4 enc error:\n%+v\n", err)
-			return
-		}
-		w.Write(o)
-	}
-	// pipe line
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		log.Fatalf("Failed to get state of stdin!\n%+v\n", err)
-		return
-	}
-	if (fi.Mode() & os.ModeNamedPipe) != os.ModeNamedPipe {
-		log.Fatalf("There's no input from named pipe!\n%+v\n", err)
-		return
-	}
-
-	inPos := 0
-	outPos := 0
-
-	if !stdin {
-		if len(fname) == 0 {
-			log.Fatal("Input file is not provided!")
-			return
-		}
-		// wrap a reader against a normal file
-		_, err := os.Stat(fname)
-		if err != nil {
-			log.Fatalw("File not found!",
-				"file", fname)
-			return
-		}
-		fn, err := os.OpenFile(fname, os.O_RDONLY, 0666)
-		if err != nil {
-			log.Errorw("Can not open file!",
-				"file", fname,
-				"error", err)
-			return
-		}
-		defer fn.Close()
-		r = bufio.NewReaderSize(fn, bufferSize)
-	}
-	if len(fname) == 0 {
-		// pipe line
-		fi, err := os.Stdin.Stat()
-		if err != nil {
-			log.Errorf("Failed to get state of stdin!\n%+v\n", err)
-			return
-		}
-		if (fi.Mode() & os.ModeNamedPipe) != os.ModeNamedPipe {
-			log.Errorf("There's no input from named pipe!\n%+v\n", err)
-			return
-		}
-		r = bufio.NewReaderSize(os.Stdin, bufferSize)
-	} else {
-		// normal file
-		_, err := os.Stat(fname)
-		if err != nil {
-			log.Errorw("File not found!",
-				"file", fname)
-			return
-		}
-		fn, err := os.OpenFile(fname, os.O_RDONLY, 0666)
-		if err != nil {
-			log.Errorw("Can not open file!",
-				"file", fname,
-				"error", err)
-			return
-		}
-		defer fn.Close()
-		r = bufio.NewReaderSize(fn, bufferSize)
-	}
-
-	if len(tag) > 0 {
-		tb, err := r.Peek(len(tag))
-		if err != nil && err != io.EOF {
-			log.Errorw("Can not read file!",
-				"file", fname,
-				"error", err)
-			return
-		}
-
-		s := string(tb)
-		encrypted := strings.Compare(s, tag) == 0
-
-		if encrypted {
-			if !decrypt {
-				log.Warnw("File already encrypted!",
-					"file", fname)
+		log.Debugf("input %x\n", b[:rl])
+		if *decrypt {
+			o, err = sm4.Sm4Ecb(hk, b[:rl], false)
+			if err != nil {
+				log.Fatalf("failed to decrypt:\n%+v\n", err)
 				return
 			}
 		} else {
-			if decrypt {
-				log.Errorw(
-					"File is not encrypted!",
-					"file", fname,
-				)
+			o, err = sm4.Sm4Ecb(hk, b[rl:], true)
+			if err != nil {
+				log.Fatalf("failed to encrypt:\n%+v\n", err)
+				return
 			}
 		}
+		log.Debugf("output %x\n", o)
+		_, err = w.Write(o)
+		if err != nil {
+			log.Fatalf("failed to write:\n%+v\n", err)
+			return
+		}
 	}
-
-	hk := []byte(*key)
-
-	log.Debugf("key = %v\n", hk)
-	data := []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10}
-	log.Debugf("data = %x\n", data)
-	sm4.SetIV([]byte(iv))                     //设置SM4算法实现的IV值,不设置则使用默认值
-	ecbMsg, err := sm4.Sm4Ecb(hk, data, true) //sm4Ecb模式pksc7填充加密
-	if err != nil {
-		log.Errorf("sm4 enc error:\n%+v\n", err)
-		return
-	}
-	log.Debugf("ecbMsg = %x\n", ecbMsg)
-	ecbDec, err := sm4.Sm4Ecb(hk, ecbMsg, false) //sm4Ecb模式pksc7填充解密
-	if err != nil {
-		log.Errorf("sm4 dec error:%s", err)
-		return
-	}
-	log.Debugf("ecbDec = %x\n", ecbDec)
 }
 
 func createLogger(level string) (logger *zap.SugaredLogger, err error) {
@@ -290,7 +192,7 @@ func createLogger(level string) (logger *zap.SugaredLogger, err error) {
 
 	// For clients implement zapcore.WriteSyncer and are safe for concurrent use,
 	// Use zapcore.AddSync for client those are safe for concurrent use, and
-	// zapcore.Lock for client that are not concurrency safe)
+	// zapcore.Lock for client that are not concurrency safe
 
 	c := zapcore.Lock(os.Stdout)
 	e := zapcore.Lock(os.Stderr)
